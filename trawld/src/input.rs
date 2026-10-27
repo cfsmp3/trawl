@@ -152,7 +152,8 @@ pub fn preprocess(
 ) -> Result<(String, String), CppError> {
     let (protected, marker) = protect_ucns(input);
     let mut command = Command::new(cpp);
-    command.args(cpp_args);
+    // Like xrdb: -P, no line markers, which would split continued lines
+    command.arg("-P").args(cpp_args);
     if let Some(dir) = include_dir {
         command.arg("-iquote").arg(dir);
     }
