@@ -198,19 +198,24 @@ impl ResourceManager {
         query_result
     }
 
-    /// Get the resource value, looked up like Xlib (matching pattern
-    /// entries), or "" if it is not found
+    /// Get the resource value, or "" if it is not found
     pub fn get_resource(&self, key: &str) -> String {
+        self.lookup_resource(key).1
+    }
+
+    /// Look the resource up like Xlib, matching pattern entries. Returns
+    /// whether it was found, and its value: unlike `get_resource`, tells a
+    /// resource with an empty value from a missing one.
+    pub fn lookup_resource(&self, key: &str) -> (bool, String) {
         let key_trimmed = trim_str(key);
-        let value = self
+        let found = self
             .resources
             .get(key_trimmed)
-            .or_else(|| xrm::lookup(&self.resources, key_trimmed))
-            .cloned()
-            .unwrap_or_default();
+            .or_else(|| xrm::lookup(&self.resources, key_trimmed));
+        let value = found.cloned().unwrap_or_default();
         self.logger
             .info(&format!("value of key {key_trimmed} is {value}"));
-        value
+        (found.is_some(), value)
     }
 
     /// Sets a resource; returns true if anything changed
@@ -424,6 +429,11 @@ impl Trawl {
     /// Get the resource value
     fn get_resource(&self, key: &str) -> String {
         self.manager().get_resource(key)
+    }
+
+    /// Look the resource up: whether it was found, and its value
+    fn lookup_resource(&self, key: &str) -> (bool, String) {
+        self.manager().lookup_resource(key)
     }
 
     /// DBus interface to set the value of a resource. Overwrites exiting value.
