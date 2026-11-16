@@ -80,6 +80,8 @@ Prefix the binaries with build directory path (`target/debug` or `target/release
 
 Run `trawld` to start the config daemon. You can pass optional arguments to the daemon to customize the behavior or to change the logging level. Run `trawld --help` documentation for more information.
 
+trawld saves its resources in `$XDG_RUNTIME_DIR/trawl` after every change, so when it is restarted on the same session bus (after a crash, for instance) it comes back with the resources it held. The saved resources are restored before trawld takes its bus name and before the file given on the command line is loaded; that file then only adds resources that are not defined yet. Resources saved on another session bus (an earlier login) are discarded.
+
 ## Using the CLI Cleint (_trawldb_)
 
 The CLI client allows the user to interact with the config manager. Primary functions of the client include loading configurations from files.  Run `trawldb --help` for more information.

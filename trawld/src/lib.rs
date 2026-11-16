@@ -2,14 +2,17 @@ mod common;
 pub mod input;
 pub mod log;
 pub mod parser;
+pub mod snapshot;
 pub mod tests;
 
 use common::trim_str;
 use log::Logger;
 use parser::CliArgs;
+use snapshot::{Restored, Snapshot};
 use std::{
     collections::HashMap,
     error::Error,
+    path::PathBuf,
     sync::{Arc, Mutex, MutexGuard},
 };
 use zbus::{connection, fdo, interface, Connection, SignalContext};
@@ -59,17 +62,81 @@ impl ResourceManager {
         );
     }
 
-    /// Runs the config daemon
+    /// Runs the config daemon, keeping the resources in memory only
     pub async fn run_server(self) -> zbus::Result<Connection> {
+        self.serve(None).await
+    }
+
+    /// Runs the config daemon and keeps a snapshot of the resources in `dir`
+    /// (trawld uses [`snapshot::runtime_dir`]), so a daemon restarted on the
+    /// same session bus gets them back. The resources saved on this bus are
+    /// restored before the startup file (if any) is loaded, and both happen
+    /// before the bus name is requested, so the first client already sees
+    /// them. Only the instance that owns the name saves the resources.
+    pub async fn run_server_with_snapshot(self, dir: PathBuf) -> zbus::Result<Connection> {
+        self.serve(Some(dir)).await
+    }
+
+    async fn serve(mut self, snapshot_dir: Option<PathBuf>) -> zbus::Result<Connection> {
+        let conn = connection::Builder::session()?.build().await?;
+        let snapshot = match snapshot_dir {
+            Some(dir) => {
+                let bus_id = fdo::DBusProxy::new(&conn).await?.get_id().await?;
+                self.restore(dir, bus_id.as_str())
+            }
+            None => None,
+        };
+        let save_now = snapshot.is_some();
+        self.init();
         let service = Trawl {
             preprocessor: self.preprocessor.clone(),
             manager: Arc::new(Mutex::new(self)),
+            snapshot,
         };
-        connection::Builder::session()?
-            .name("org.regolith.Trawl")?
-            .serve_at("/org/regolith/Trawl", service)?
-            .build()
-            .await
+        conn.object_server()
+            .at("/org/regolith/Trawl", service)
+            .await?;
+        conn.request_name("org.regolith.Trawl").await?;
+        if save_now {
+            // Replaces a snapshot of another bus or a damaged one, and keeps
+            // what the startup file added
+            conn.object_server()
+                .interface::<_, Trawl>("/org/regolith/Trawl")
+                .await?
+                .get()
+                .await
+                .change(|_| true);
+        }
+        Ok(conn)
+    }
+
+    /// Restores the resources saved in `dir` on the bus with `bus_id`.
+    /// Returns where to save them, or None if they can only be kept in memory.
+    fn restore(&mut self, dir: PathBuf, bus_id: &str) -> Option<Snapshot> {
+        let snapshot = match Snapshot::in_dir(dir, bus_id) {
+            Ok(snapshot) => snapshot,
+            Err(e) => {
+                self.logger.error(&e);
+                return None;
+            }
+        };
+        match snapshot.restore() {
+            Ok(Restored::Resources(resources)) => {
+                self.logger.info(&format!(
+                    "restored {} resources from {}",
+                    resources.len(),
+                    snapshot.dir().display()
+                ));
+                self.resources = resources;
+            }
+            Ok(Restored::OtherBus) => self.logger.info(&format!(
+                "discarding the resources in {} saved on another session bus",
+                snapshot.dir().display()
+            )),
+            Ok(Restored::Nothing) => (),
+            Err(e) => self.logger.error(&format!("{e}; starting without resources")),
+        }
+        Some(snapshot)
     }
 
     /// Returns the content of the file after preprocessing
@@ -261,11 +328,29 @@ enum Mode {
 pub struct Trawl {
     manager: Arc<Mutex<ResourceManager>>,
     preprocessor: String,
+    snapshot: Option<Snapshot>,
 }
 
 impl Trawl {
     fn manager(&self) -> MutexGuard<'_, ResourceManager> {
         self.manager.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Runs `change`, which returns whether it changed the resources, and
+    /// saves them before the lock is released: the saved resources follow
+    /// the order of the changes, and a call is answered only once its change
+    /// is saved. If saving fails, the change is kept all the same.
+    fn change(&self, change: impl FnOnce(&mut ResourceManager) -> bool) -> bool {
+        let mut manager = self.manager();
+        let changed = change(&mut manager);
+        if changed {
+            if let Some(snapshot) = &self.snapshot {
+                if let Err(e) = snapshot.save(&manager.resources) {
+                    manager.logger.error(&e);
+                }
+            }
+        }
+        changed
     }
 
     async fn emit_resources_changed(&self, ctxt: &SignalContext<'_>) {
@@ -275,11 +360,13 @@ impl Trawl {
     }
 
     fn apply(&self, mode: Mode, text: &str) {
-        let mut manager = self.manager();
-        match mode {
-            Mode::Load => manager.apply_load(text),
-            Mode::Merge => manager.apply_merge(text),
-        }
+        self.change(|manager| {
+            match mode {
+                Mode::Load => manager.apply_load(text),
+                Mode::Merge => manager.apply_merge(text),
+            }
+            true
+        });
     }
 
     async fn from_file(
@@ -432,7 +519,7 @@ impl Trawl {
         key: String,
         val: String,
     ) {
-        let changed = self.manager().handle_set(&key, &val);
+        let changed = self.change(|manager| manager.handle_set(&key, &val));
         if changed {
             self.emit_resources_changed(&ctxt).await;
         }
@@ -446,7 +533,7 @@ impl Trawl {
         key: String,
         val: String,
     ) {
-        let changed = self.manager().handle_add(&key, &val);
+        let changed = self.change(|manager| manager.handle_add(&key, &val));
         if changed {
             self.emit_resources_changed(&ctxt).await;
         }
@@ -454,29 +541,27 @@ impl Trawl {
 
     /// Dbus interface to remove all entries from config manager
     async fn remove_all(&self, #[zbus(signal_context)] ctxt: SignalContext<'_>) {
-        let num_of_resources = {
-            let mut manager = self.manager();
+        let changed = self.change(|manager| {
             let n = manager.resources.len();
             manager.handle_remove_all();
             manager.logger.warn("All resources cleared");
-            n
-        };
-        if num_of_resources > 0 {
+            n > 0
+        });
+        if changed {
             self.emit_resources_changed(&ctxt).await;
         }
     }
 
     /// Dbus interface to remove single entry from config manager
     async fn remove_one(&self, #[zbus(signal_context)] ctxt: SignalContext<'_>, key: &str) {
-        let removed_entry = {
-            let mut manager = self.manager();
+        let changed = self.change(|manager| {
             let removed = manager.handle_remove_one(trim_str(key));
             if let Some(pair) = &removed {
                 manager.logger.warn(&format!("Resource cleared {:?}", pair));
             }
-            removed
-        };
-        if removed_entry.is_some() {
+            removed.is_some()
+        });
+        if changed {
             self.emit_resources_changed(&ctxt).await;
         }
     }

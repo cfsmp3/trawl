@@ -1,6 +1,6 @@
 use std::{process, error::Error, future::pending};
 use clap::Parser;
-use trawld::{ResourceManager, parser::CliArgs};
+use trawld::{log::Logger, parser::CliArgs, snapshot, ResourceManager};
 
 
 #[tokio::main]
@@ -14,9 +14,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
             process::exit(1);
         }
     };
-    let mut manager = ResourceManager::from_args(&args);
-    manager.init();
-    let _conn = manager.run_server().await?;
+    let manager = ResourceManager::from_args(&args);
+    let _conn = match snapshot::runtime_dir() {
+        Ok(dir) => manager.run_server_with_snapshot(dir).await?,
+        Err(e) => {
+            Logger::from(&args).error(&e);
+            manager.run_server().await?
+        }
+    };
     pending::<()>().await;
     Ok(())
 }
