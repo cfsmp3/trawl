@@ -9,7 +9,7 @@ use std::{
     fs::{self, Permissions},
     io::{BufRead, BufReader, ErrorKind},
     os::unix::fs::PermissionsExt,
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::{Child, Command, ExitStatus, Stdio},
     time::{Duration, Instant},
 };
@@ -93,9 +93,11 @@ struct Bus {
 }
 
 impl Bus {
-    /// Returns None if dbus-daemon isn't installed
-    fn start(dir: &Path) -> Option<Bus> {
-        let listen = format!("--address=unix:tmpdir={}", dir.display());
+    /// Returns None if dbus-daemon isn't installed. The socket goes in the
+    /// temporary directory itself: a socket path can't be longer than 107
+    /// bytes, so a deeper directory could break with a long TMPDIR.
+    fn start() -> Option<Bus> {
+        let listen = format!("--address=unix:tmpdir={}", std::env::temp_dir().display());
         let spawned = Command::new("dbus-daemon")
             .args(["--session", "--nofork", "--print-address", &listen])
             .stdout(Stdio::piped())
@@ -112,6 +114,7 @@ impl Bus {
         BufReader::new(child.stdout.take().unwrap())
             .read_line(&mut address)
             .unwrap();
+        assert!(!address.trim().is_empty(), "dbus-daemon did not start");
         Some(Bus {
             address: address.trim().to_owned(),
             _daemon: Process(child),
@@ -185,7 +188,7 @@ impl Bus {
 #[tokio::test]
 async fn resources_survive_a_kill() {
     let scratch = Scratch::new();
-    let Some(bus) = Bus::start(&scratch.0) else {
+    let Some(bus) = Bus::start() else {
         return;
     };
     let trawld = bus.start_trawld(&scratch, &[]).await;
@@ -216,7 +219,7 @@ async fn resources_survive_a_kill() {
 #[tokio::test]
 async fn startup_file_only_adds_what_is_missing() {
     let scratch = Scratch::new();
-    let Some(bus) = Bus::start(&scratch.0) else {
+    let Some(bus) = Bus::start() else {
         return;
     };
     let trawld = bus.start_trawld(&scratch, &[]).await;
@@ -237,14 +240,14 @@ async fn startup_file_only_adds_what_is_missing() {
 #[tokio::test]
 async fn another_bus_starts_empty() {
     let scratch = Scratch::new();
-    let Some(first) = Bus::start(&scratch.0) else {
+    let Some(first) = Bus::start() else {
         return;
     };
     let trawld = first.start_trawld(&scratch, &[]).await;
     first.proxy().await.set_resource("a", "1").await.unwrap();
     first.kill_trawld(trawld).await;
 
-    let second = Bus::start(&scratch.0).unwrap();
+    let second = Bus::start().unwrap();
     let trawld = second.start_trawld(&scratch, &[]).await;
     assert!(second.proxy().await.resources().await.unwrap().is_empty());
     second.kill_trawld(trawld).await;
@@ -257,7 +260,7 @@ async fn another_bus_starts_empty() {
 #[tokio::test]
 async fn second_instance_leaves_the_snapshot_alone() {
     let scratch = Scratch::new();
-    let Some(bus) = Bus::start(&scratch.0) else {
+    let Some(bus) = Bus::start() else {
         return;
     };
     let trawld = bus.start_trawld(&scratch, &[]).await;
@@ -285,7 +288,7 @@ async fn second_instance_leaves_the_snapshot_alone() {
 #[tokio::test]
 async fn unsafe_snapshot_dir_is_not_used() {
     let scratch = Scratch::new();
-    let Some(bus) = Bus::start(&scratch.0) else {
+    let Some(bus) = Bus::start() else {
         return;
     };
     fs::create_dir(scratch.snapshot_dir()).unwrap();
